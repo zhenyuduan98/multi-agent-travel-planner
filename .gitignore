@@ -1,0 +1,22 @@
+# 密钥
+.env
+
+# 运行产物
+.travel_runs/
+.demo_runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 课程资料（版权归课程方，不公开发布）
+scripts/
+materials/
+assets/
+*.ipynb
+*.pdf
+主Agent调度与多Agent协作.md
+笔记.md
