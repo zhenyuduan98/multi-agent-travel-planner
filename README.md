@@ -120,17 +120,6 @@ $ python -m travel_assistant plan --scenario scenarios/usa_30days.json --concurr
 
 报告其余章节：行程总览、机票与城际交通、住宿建议、美食清单、玩乐与门票、教育与研学、预订时间线与清单、风险与待核实事项、数据来源与事实核查。
 
-### 离线版 vs 联网版
-
-同一个场景，加入工具之前的离线版本保存在 [`examples/usa_30days_report_offline.md`](examples/usa_30days_report_offline.md)，可以直接对比：
-
-| 问题 | 离线版（模型凭记忆） | 联网版 |
-|---|---|---|
-| 餐厅放错城市 | 在纽约行程里推荐 The Apple Pan（实际在洛杉矶） | 推荐的餐厅、酒店先经 `lookup_place` 确认存在且在对应城市 |
-| 虚构酒店 | 优胜美地住 "Ahwiyah Point Lodge"（不存在） | Yosemite Valley Lodge、The Ahwahnee Dining Room，均有 OpenStreetMap / 官网来源 |
-| 车程 | "盐湖城转车至大峡谷南缘约 5 小时"（实际约 10 小时） | 车程来自 OSRM，如旧金山 → 优胜美地 299 km / 4.5 h；事实核查把大峡谷 → 拉斯维加斯的 4.5 h 修正为 3.2 h |
-| 来源 | 无 | 211 条来源，逐卡列在报告末尾 |
-
 ## 为什么要用多 Agent
 
 让一个模型在一次长对话里完成 30 天的行程规划，常见三个问题：
@@ -160,7 +149,7 @@ $ python -m travel_assistant plan --scenario scenarios/usa_30days.json --concurr
 - **流式进度**：终端实时显示各子 Agent 的进度，`-v` 可以看到子 Agent 逐字输出。
 - **需求可复用**：需求写在 JSON 场景文件里，也可以完全用命令行参数指定；子 Agent 的角色同样可以在场景文件里自定义。
 - **自动验收**：`check` 命令检查任务是否全部完成、报告章节是否齐全、每日行程是否逐日覆盖，联网模式下还会检查每张卡是否留下来源。
-- **可离线运行**：加 `--offline` 不使用任何工具，只凭模型知识生成，用于对比或无网络环境。
+- **可离线运行**：加 `--offline` 不使用任何工具，只凭模型知识生成，适合无网络环境或想快速出草稿时使用。
 
 ## 架构
 
@@ -377,7 +366,7 @@ python -m travel_assistant plan --scenario scenarios/usa_30days.json --days 21 -
 python -m travel_assistant plan --scenario scenarios/usa_30days.json --dry-run
 python -m travel_assistant resume
 
-# 不联网（只凭模型知识，速度快，用于对比）
+# 不联网（只凭模型知识，速度快）
 python -m travel_assistant plan --scenario scenarios/usa_30days.json --offline
 
 # 查看某个子 Agent 调用了哪些工具、引用了哪些来源
@@ -497,8 +486,7 @@ travel_assistant/
 scenarios/
 └── usa_30days.json   # 示例场景：美国 30 天
 examples/
-├── usa_30days_report.md          # 联网核实模式的模型原始输出
-└── usa_30days_report_offline.md  # 离线模式的模型原始输出（对比用）
+└── usa_30days_report.md  # 示例场景的模型原始输出（联网核实模式）
 tests/                # pytest，使用假模型和假工具后端
 ```
 
@@ -506,7 +494,7 @@ tests/                # pytest，使用假模型和假工具后端
 
 ## 已知问题与后续计划
 
-联网核实明显减少了"编造地点"和"车程离谱"这两类错误，但没有消除所有问题。在[联网版示例](examples/usa_30days_report.md)里仍能看到：
+联网核实能有效避免"编造地点"和"车程离谱"这两类错误，但不能消除所有问题。在[示例输出](examples/usa_30days_report.md)里仍能看到：
 
 | 位置 | 问题 | 原因 |
 |---|---|---|
