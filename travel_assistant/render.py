@@ -69,7 +69,24 @@ class LiveEventPrinter:
             attempt = f"（第 {event['attempt']} 次）" if event.get("attempt", 1) > 1 else ""
             c.print(f"[yellow]▶[/] {task_id} [magenta]{event['agent']}[/] 开始{attempt}")
         elif kind == "task_done":
-            c.print(f"{'' if not self.verbose else chr(10)}[green]✓[/] {task_id} 完成（{event['chars']} 字）")
+            extra = f"，工具 {event['tools']} 次 / 来源 {event['sources']} 条" if event.get("tools") else ""
+            c.print(f"{'' if not self.verbose else chr(10)}[green]✓[/] {task_id} 完成（{event['chars']} 字{extra}）")
+        elif kind == "tool_call":
+            if self.verbose:
+                mark = "[green]✓[/]" if event["ok"] else "[red]✗[/]"
+                c.print(f"\n  {mark} [dim]{task_id} → {event['tool']} {event['arguments']}[/]")
+        elif kind == "repairing_days":
+            c.print(f"[yellow]每日行程缺少 {len(event['missing'])} 天，主 Agent 正在补全…[/]")
+        elif kind == "days_repaired":
+            c.print(f"[green]✓[/] 每日行程补全：缺 {event['before']} 天 → 缺 {event['after']} 天")
+        elif kind == "fact_check_started":
+            c.print("[bold]事实核查 Agent[/] 正在用工具核查方案中的硬事实…")
+        elif kind == "fact_check_done":
+            c.print(
+                f"[green]✓[/] 事实核查完成：核查 {event['checked']} 条，发现错误 {event['wrong']} 条，自动修正 {event['applied']} 处"
+            )
+        elif kind == "fact_check_failed":
+            c.print(f"[yellow]事实核查失败，保留未核查的草稿:[/] {event['reason']}")
         elif kind == "task_retry":
             c.print(f"[yellow]↻[/] {task_id} 失败，将重试: {event['reason']}")
         elif kind == "task_failed":
@@ -92,7 +109,7 @@ def print_summary(console: Console, state: RunState) -> None:
         Panel.fit(
             escape(
                 f"{req.title}\n{req.destination} · {req.days} 天 · {req.travelers} · 预算 {req.budget}\n"
-                f"状态: {state.status}   模型: {state.model or '-'}"
+                f"状态: {state.status}   模式: {'联网核实' if state.grounded else '离线'}   模型: {state.model or '-'}"
             ),
             title="运行概览",
         )

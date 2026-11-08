@@ -7,17 +7,26 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from travel_assistant.board import DONE, FAILED, RUNNING, TODO, Board, BoardError, validate_board
-from travel_assistant.llm import LLM, parse_json_object
+from travel_assistant.llm import LLM, ToolCallRecord, parse_json_object
 from travel_assistant.prompts import (
+    FACT_CHECK_SYSTEM,
     PLANNER_SYSTEM,
     SYNTH_SYSTEM,
     WORKER_SYSTEM,
+    WORKER_SYSTEM_WITH_TOOLS,
+    apply_corrections,
+    fact_check_prompt,
     handoff_summary,
+    missing_days,
     planner_prompt,
+    repair_days_prompt,
+    replace_section,
+    sources_appendix,
     synth_prompt,
     worker_prompt,
 )
 from travel_assistant.scenario import TripRequest
+from travel_assistant.tools import ToolBox
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -33,6 +42,10 @@ class RunOptions:
     plan_attempts: int = 3
     worker_max_chars: int = 900
     stream_workers: bool = True
+    tool_rounds: int = 4
+    fact_check: bool = True
+    fact_check_claims: int = 12
+    fact_check_rounds: int = 4
 
 
 @dataclass
@@ -43,19 +56,25 @@ class RunState:
     board: Board = field(default_factory=Board)
     raw_plan: dict[str, Any] = field(default_factory=dict)
     report: str = ""
+    draft_report: str = ""
+    fact_check: dict[str, Any] = field(default_factory=dict)
     status: str = "created"
     events: list[dict[str, Any]] = field(default_factory=list)
     worker_inputs: dict[str, str] = field(default_factory=dict)
     model: str = ""
+    grounded: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "model": self.model,
+            "grounded": self.grounded,
             "request": self.request.to_dict(),
             "raw_plan": self.raw_plan,
             "tasks": self.board.to_list(),
             "worker_inputs": self.worker_inputs,
+            "draft_report": self.draft_report,
+            "fact_check": self.fact_check,
             "report": self.report,
             "events": self.events,
         }
@@ -69,10 +88,12 @@ class Orchestrator:
         options: RunOptions | None = None,
         on_event: EventSink | None = None,
         on_checkpoint: Callable[[RunState], None] | None = None,
+        tools: ToolBox | None = None,
     ) -> None:
         self.planner = planner
         self.worker = worker or planner
         self.options = options or RunOptions()
+        self.tools = tools
         self._sink = on_event or _ignore
         self._checkpoint = on_checkpoint or (lambda _state: None)
         self._lock = asyncio.Lock()
@@ -90,6 +111,7 @@ class Orchestrator:
 
     async def run(self, state: RunState) -> RunState:
         state.model = f"planner={self.planner.model}, worker={self.worker.model}"
+        state.grounded = self.tools is not None
         if not state.board.cards:
             await self.plan(state)
         else:
@@ -157,6 +179,22 @@ class Orchestrator:
             )
         self.save(state)
 
+    def _tool_callback(self, state: RunState, task_id: str):
+        async def on_tool(_kind: str, call: dict[str, Any], record: ToolCallRecord) -> None:
+            await self.emit(
+                state,
+                {
+                    "event": "tool_call",
+                    "task_id": task_id,
+                    "tool": call["name"],
+                    "arguments": call["arguments"][:200],
+                    "ok": record.ok,
+                    "summary": record.summary[:120],
+                },
+            )
+
+        return on_tool
+
     async def _run_card(self, state: RunState, task_id: str, semaphore: asyncio.Semaphore) -> None:
         board, request = state.board, state.request
         async with semaphore:
@@ -173,10 +211,24 @@ class Orchestrator:
             async def on_delta(text: str) -> None:
                 await self.emit(state, {"event": "worker_delta", "task_id": task_id, "text": text})
 
+            delta = on_delta if self.options.stream_workers else None
+            sources: tuple[dict[str, str], ...] = ()
+            tool_calls: tuple[dict[str, Any], ...] = ()
             try:
-                result = await self.worker.complete(
-                    WORKER_SYSTEM, prompt, on_delta=on_delta if self.options.stream_workers else None
-                )
+                if self.tools is not None:
+                    agent_result = await self.worker.run_agent(
+                        WORKER_SYSTEM_WITH_TOOLS,
+                        prompt,
+                        self.tools,
+                        max_rounds=self.options.tool_rounds,
+                        on_delta=delta,
+                        on_tool=self._tool_callback(state, task_id),
+                    )
+                    result = agent_result.text
+                    sources = tuple(s.to_dict() for s in agent_result.sources)
+                    tool_calls = tuple(t.to_dict() for t in agent_result.tool_calls)
+                else:
+                    result = await self.worker.complete(WORKER_SYSTEM, prompt, on_delta=delta)
                 if not result.strip():
                     raise RuntimeError("子 Agent 返回了空结果")
             except Exception as exc:
@@ -191,17 +243,88 @@ class Orchestrator:
                 return
 
             async with self._lock:
-                board.update(task_id, status=DONE, result=result.strip(), error="")
+                board.update(
+                    task_id, status=DONE, result=result.strip(), error="", sources=sources, tool_calls=tool_calls
+                )
                 self.save(state)
-            await self.emit(state, {"event": "task_done", "task_id": task_id, "chars": len(result)})
+            await self.emit(
+                state,
+                {"event": "task_done", "task_id": task_id, "chars": len(result), "tools": len(tool_calls), "sources": len(sources)},
+            )
 
     async def synthesize(self, state: RunState) -> None:
         state.status = "synthesizing"
         await self.emit(state, {"event": "synthesizing"})
-        state.report = (await self.planner.complete(SYNTH_SYSTEM, synth_prompt(state.request, state.board))).strip()
+        draft = (
+            await self.planner.complete(
+                SYNTH_SYSTEM, synth_prompt(state.request, state.board, grounded=self.tools is not None)
+            )
+        ).strip()
+        draft = await self._repair_days(state, draft)
+        state.draft_report = draft
+        self.save(state)
+
+        report = draft
+        if self.tools is not None and self.options.fact_check:
+            report = await self._fact_check(state, draft)
+        state.report = report + "\n" + sources_appendix(state.board, state.fact_check or None)
         state.status = "completed"
         await self.emit(state, {"event": "report_ready", "chars": len(state.report)})
         self.save(state)
+
+    async def _repair_days(self, state: RunState, draft: str) -> str:
+        """主 Agent 偶尔会合并或省略天数；缺天时只重写「每日行程」章节，最多一次。"""
+
+        days = state.request.days
+        missing = missing_days(draft, days)
+        if not missing:
+            return draft
+        await self.emit(state, {"event": "repairing_days", "missing": missing[:20]})
+        section = await self.planner.complete(SYNTH_SYSTEM, repair_days_prompt(draft, days, missing))
+        repaired = replace_section(draft, "## 每日行程", section)
+        still = missing_days(repaired, days)
+        await self.emit(state, {"event": "days_repaired", "before": len(missing), "after": len(still)})
+        return repaired if len(still) < len(missing) else draft
+
+    async def _fact_check(self, state: RunState, draft: str) -> str:
+        """事实核查 Agent：拿着工具核查草稿中的硬事实，只应用逐字匹配、有证据的修正。"""
+
+        assert self.tools is not None
+        await self.emit(state, {"event": "fact_check_started"})
+        try:
+            agent_result = await self.planner.run_agent(
+                FACT_CHECK_SYSTEM,
+                fact_check_prompt(draft, self.options.fact_check_claims, state.request.language),
+                self.tools,
+                max_rounds=self.options.fact_check_rounds,
+                on_tool=self._tool_callback(state, "fact_check"),
+            )
+            verdict = parse_json_object(agent_result.text)
+        except Exception as exc:
+            state.fact_check = {"error": str(exc)[:300], "checked": [], "applied": []}
+            await self.emit(state, {"event": "fact_check_failed", "reason": str(exc)[:200]})
+            return draft
+
+        checked = [c for c in verdict.get("checked", []) if isinstance(c, dict)]
+        corrections = [c for c in verdict.get("corrections", []) if isinstance(c, dict)]
+        report, applied = apply_corrections(draft, corrections)
+        state.fact_check = {
+            "checked": checked,
+            "proposed": corrections,
+            "applied": applied,
+            "tool_calls": [t.to_dict() for t in agent_result.tool_calls],
+            "sources": [s.to_dict() for s in agent_result.sources],
+        }
+        await self.emit(
+            state,
+            {
+                "event": "fact_check_done",
+                "checked": len(checked),
+                "wrong": sum(c.get("verdict") == "wrong" for c in checked),
+                "applied": len(applied),
+            },
+        )
+        return report
 
 
 def state_from_dict(data: dict[str, Any]) -> RunState:
@@ -212,10 +335,13 @@ def state_from_dict(data: dict[str, Any]) -> RunState:
         board=Board.from_list(data.get("tasks", [])),
         raw_plan=data.get("raw_plan", {}),
         report=data.get("report", ""),
+        draft_report=data.get("draft_report", ""),
+        fact_check=dict(data.get("fact_check", {}) or {}),
         status=data.get("status", "created"),
         events=list(data.get("events", [])),
         worker_inputs=dict(data.get("worker_inputs", {})),
         model=data.get("model", ""),
+        grounded=bool(data.get("grounded", False)),
     )
 
 

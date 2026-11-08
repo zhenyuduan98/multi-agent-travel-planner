@@ -29,7 +29,7 @@ SECTIONS = "\n".join(
 
 def make_report(days: int) -> str:
     daily = "\n".join(f"- 第 {d} 天：安排" for d in range(1, days + 1))
-    return f"# 方案\n{SECTIONS}\n{daily}"
+    return f"# 方案\n{SECTIONS}\n{daily}\n盐湖城到大峡谷约5小时"
 
 
 class FakeLLM:
@@ -41,13 +41,20 @@ class FakeLLM:
         fail_tasks: dict[str, int] | None = None,
         report_days: int = 30,
         delay: float = 0.0,
+        fact_check_raises: bool = False,
+        report_days_after_repair: int = 0,
     ) -> None:
         self.model = "fake"
         self.plans = list(plans or [GOOD_PLAN])
         self.fail_tasks = dict(fail_tasks or {})
         self.report_days = report_days
+        self.report_days_after_repair = report_days_after_repair
+        self.repair_prompts: list[str] = []
         self.delay = delay
+        self.fact_check_raises = fact_check_raises
+        self.agent_calls: list[str] = []
         self.worker_prompts: dict[str, str] = {}
+        self.worker_systems: dict[str, str] = {}
         self.planner_prompts: list[str] = []
         self.active = 0
         self.max_active = 0
@@ -59,10 +66,15 @@ class FakeLLM:
             plan = self.plans.pop(0) if len(self.plans) > 1 else self.plans[0]
             return plan if isinstance(plan, str) else json.dumps(plan, ensure_ascii=False)
         if system == SYNTH_SYSTEM:
+            if "缺少:" in user:
+                self.repair_prompts.append(user)
+                daily = "\n".join(f"| 第 {d} 天 | 城市 |" for d in range(1, self.report_days_after_repair + 1))
+                return f"## 每日行程\n{daily}"
             return make_report(self.report_days)
 
         task_id = next(t["task_id"] for t in GOOD_PLAN["tasks"] if f"任务: {t['title']}\n" in user)
         self.worker_prompts[task_id] = user
+        self.worker_systems[task_id] = system
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
@@ -79,6 +91,72 @@ class FakeLLM:
             self.active -= 1
 
     async def aclose(self) -> None:
+        self.closed = True
+
+    async def run_agent(self, system, user, tools, *, max_rounds=6, on_delta=None, on_tool=None, require_tool=True):
+        """模拟工具调用：子 Agent 查一次地点、一次路线；事实核查 Agent 修正一处错误。"""
+
+        from travel_assistant.llm import AgentResult, ToolCallRecord
+        from travel_assistant.prompts import FACT_CHECK_SYSTEM
+
+        self.agent_calls.append(system)
+        if system == FACT_CHECK_SYSTEM:
+            if self.fact_check_raises:
+                raise RuntimeError("fact check boom")
+            outcome = await tools.call("drive_route", {"origin": "Salt Lake City", "destination": "Grand Canyon"})
+            record = ToolCallRecord("drive_route", "{}", outcome.ok, outcome.content)
+            if on_tool:
+                await on_tool("tool_result", {"name": "drive_route", "arguments": "{}"}, record)
+            verdict = {
+                "checked": [
+                    {"claim": "SLC 到大峡谷约 5 小时", "verdict": "wrong", "evidence": outcome.content},
+                    {"claim": "某餐厅营业到午夜", "verdict": "unverified", "evidence": "查不到"},
+                ],
+                "corrections": [
+                    {"find": "约5小时", "replace": "约10小时", "reason": "OSRM"},
+                    {"find": "报告里不存在的文字", "replace": "x", "reason": "应被忽略"},
+                ],
+            }
+            return AgentResult(json.dumps(verdict, ensure_ascii=False), [record], outcome.sources)
+
+        place = await tools.call("lookup_place", {"name": "Katz's Delicatessen, New York"})
+        route = await tools.call("drive_route", {"origin": "A", "destination": "B"})
+        records = [
+            ToolCallRecord("lookup_place", "{}", place.ok, place.content),
+            ToolCallRecord("drive_route", "{}", route.ok, route.content),
+        ]
+        if on_tool:
+            for record in records:
+                await on_tool("tool_result", {"name": record.name, "arguments": "{}"}, record)
+        text = await self.complete(system, user, on_delta=on_delta)
+        return AgentResult(text, records, place.sources + route.sources)
+
+
+class FakeBackend:
+    """不联网的工具后端：固定的搜索结果、坐标和路线。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, Any]] = []
+        self.closed = False
+
+    async def search(self, query, max_results):
+        from travel_assistant.tools import Source
+
+        self.calls.append(("search", query))
+        return [Source(f"Result for {query}", f"https://example.com/{len(self.calls)}", "snippet")]
+
+    async def geocode(self, query):
+        self.calls.append(("geocode", query))
+        if self.fail or query == "Nowhere":
+            return None
+        return {"name": f"{query}, USA", "lat": 40.0 + len(query) / 100, "lon": -110.0, "osm_url": f"https://osm.org/{query}"}
+
+    async def route(self, start, end):
+        self.calls.append(("route", (start, end)))
+        return {"km": 840.0, "hours": 10.2}
+
+    async def aclose(self):
         self.closed = True
 
 

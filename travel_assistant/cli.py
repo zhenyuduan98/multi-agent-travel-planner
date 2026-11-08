@@ -19,15 +19,26 @@ from rich.console import Console
 from travel_assistant.board import DONE
 from travel_assistant.llm import LLM, LLMConfigError, QwenLLM
 from travel_assistant.orchestrator import Orchestrator, RunOptions, RunState
+from travel_assistant.prompts import missing_days
 from travel_assistant.render import LiveEventPrinter, print_report, print_summary
 from travel_assistant.scenario import TripRequest, apply_overrides, load_scenario, scenario_template
 from travel_assistant.storage import RunStore
+from travel_assistant.tools import ToolBox
 
 LLMFactory = Any
+ToolsFactory = Any
 
 
 def default_llm_factory(model: str | None, temperature: float) -> LLM:
     return QwenLLM(model=model, temperature=temperature)
+
+
+def default_tools_factory() -> ToolBox:
+    try:
+        from travel_assistant.tools import PublicBackend
+    except ImportError as exc:
+        raise ValueError(f"联网工具依赖缺失（{exc}），请 pip install -r requirements.txt，或加 --offline") from exc
+    return ToolBox(PublicBackend())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +90,9 @@ def _add_run_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-attempts", type=int, default=2, help="每张卡最多尝试次数")
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("-v", "--verbose", action="store_true", help="实时打印子 Agent 输出")
+    p.add_argument("--offline", action="store_true", help="不使用联网工具（子 Agent 只凭模型知识回答）")
+    p.add_argument("--no-fact-check", dest="fact_check", action="store_false", help="跳过汇总后的事实核查")
+    p.add_argument("--tool-rounds", type=int, default=4, help="每个子 Agent 最多调用工具的轮数")
 
 
 PLAN_FIELDS = (
@@ -105,19 +119,29 @@ async def _execute(
     run_dir: Path,
     state: RunState,
     llm_factory: LLMFactory,
+    tools_factory: ToolsFactory,
     dry_run: bool = False,
 ) -> int:
     planner = llm_factory(args.model, args.temperature)
     worker = llm_factory(args.worker_model, args.temperature) if args.worker_model else planner
-    options = RunOptions(concurrency=args.concurrency, max_attempts=args.max_attempts)
+    tools = None if (args.offline or dry_run) else tools_factory()
+    options = RunOptions(
+        concurrency=args.concurrency,
+        max_attempts=args.max_attempts,
+        tool_rounds=args.tool_rounds,
+        fact_check=args.fact_check,
+    )
     orch = Orchestrator(
         planner,
         worker,
         options,
         on_event=LiveEventPrinter(console, verbose=args.verbose),
         on_checkpoint=lambda s: store.save(run_dir, s),
+        tools=tools,
     )
     console.print(f"[dim]运行目录: {run_dir}[/]")
+    if not dry_run:
+        console.print("[dim]模式: " + ("离线（不联网）" if tools is None else "联网核实（网页搜索 / 地点查询 / 驾车路线）") + "[/]")
     try:
         if dry_run:
             await orch.plan(state)
@@ -133,6 +157,8 @@ async def _execute(
         await planner.aclose()
         if worker is not planner:
             await worker.aclose()
+        if tools is not None:
+            await tools.aclose()
 
     console.print()
     print_summary(console, state)
@@ -144,21 +170,27 @@ async def _execute(
     return 0
 
 
-def cmd_plan(args: argparse.Namespace, console: Console, store: RunStore, llm_factory: LLMFactory) -> int:
+def cmd_plan(
+    args: argparse.Namespace, console: Console, store: RunStore, llm_factory: LLMFactory, tools_factory: ToolsFactory
+) -> int:
     request = build_request(args)
     run_dir = store.new_run_dir(request.title)
     state = RunState(request=request)
     store.save(run_dir, state)
-    return asyncio.run(_execute(args, console, store, run_dir, state, llm_factory, dry_run=args.dry_run))
+    return asyncio.run(
+        _execute(args, console, store, run_dir, state, llm_factory, tools_factory, dry_run=args.dry_run)
+    )
 
 
-def cmd_resume(args: argparse.Namespace, console: Console, store: RunStore, llm_factory: LLMFactory) -> int:
+def cmd_resume(
+    args: argparse.Namespace, console: Console, store: RunStore, llm_factory: LLMFactory, tools_factory: ToolsFactory
+) -> int:
     run_dir = store.resolve(args.run)
     state = store.load(run_dir)
     if state.status == "completed":
         console.print(f"[green]{run_dir.name} 已经完成，无需续跑。[/]")
         return 0
-    return asyncio.run(_execute(args, console, store, run_dir, state, llm_factory))
+    return asyncio.run(_execute(args, console, store, run_dir, state, llm_factory, tools_factory))
 
 
 def cmd_list(console: Console, store: RunStore) -> int:
@@ -193,6 +225,15 @@ def cmd_show(args: argparse.Namespace, console: Console, store: RunStore) -> int
         card = state.board.get(args.task)
         console.rule(f"{card.task_id} · {card.agent} · {card.status}")
         print_report(console, card.result or f"_（无输出）_ {card.error}")
+        if card.tool_calls:
+            console.rule(f"工具调用（{len(card.tool_calls)} 次）")
+            for call in card.tool_calls:
+                mark = "✓" if call.get("ok") else "✗"
+                console.print(f"{mark} {call.get('name')} {call.get('arguments')}", markup=False)
+        if card.sources:
+            console.rule(f"来源（{len(card.sources)} 条）")
+            for source in card.sources:
+                console.print(f"- {source.get('title')}  {source.get('url')}", markup=False)
         return 0
     print_summary(console, state)
     if not args.board_only:
@@ -225,9 +266,26 @@ def check_state(state: RunState) -> list[str]:
             if section not in state.report:
                 problems.append(f"最终方案缺少章节: {section}")
         days = state.request.days
-        if f"第 {days} 天" not in state.report and f"第{days}天" not in state.report and f"Day {days}" not in state.report:
-            problems.append(f"每日行程没有覆盖到第 {days} 天")
+        gaps = missing_days(state.report.split("## 数据来源与事实核查")[0], days)
+        if gaps:
+            shown = "、".join(str(d) for d in gaps[:10]) + ("…" if len(gaps) > 10 else "")
+            problems.append(f"每日行程缺少 {len(gaps)} 天（第 {shown} 天）")
+    if state.grounded:
+        if not any(card.sources for card in state.board.cards):
+            problems.append("联网模式下没有任何子 Agent 留下数据来源")
+        if state.fact_check.get("error"):
+            problems.append(f"事实核查失败: {state.fact_check['error']}")
     return problems
+
+
+def grounding_stats(state: RunState) -> dict[str, int]:
+    return {
+        "tool_calls": sum(len(c.tool_calls) for c in state.board.cards),
+        "sources": sum(len(c.sources) for c in state.board.cards),
+        "cards_with_sources": sum(bool(c.sources) for c in state.board.cards),
+        "fact_checked": len(state.fact_check.get("checked", [])),
+        "corrected": len(state.fact_check.get("applied", [])),
+    }
 
 
 def cmd_check(args: argparse.Namespace, console: Console, store: RunStore) -> int:
@@ -237,6 +295,15 @@ def cmd_check(args: argparse.Namespace, console: Console, store: RunStore) -> in
     problems = check_state(state)
     deltas = sum(e.get("event") == "worker_delta" for e in state.events)
     console.print(f"worker_delta 事件: {deltas}")
+    if state.grounded:
+        s = grounding_stats(state)
+        console.print(
+            f"联网核实: 工具调用 {s['tool_calls']} 次，来源 {s['sources']} 条"
+            f"（{s['cards_with_sources']}/{len(state.board.cards)} 张卡有来源）；"
+            f"事实核查 {s['fact_checked']} 条，自动修正 {s['corrected']} 处"
+        )
+    else:
+        console.print("[yellow]离线模式运行：内容未经联网核实[/]")
     if problems:
         console.print("[red]验收未通过:[/]")
         for item in problems:
@@ -261,6 +328,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     llm_factory: LLMFactory = default_llm_factory,
+    tools_factory: ToolsFactory = default_tools_factory,
     console: Console | None = None,
 ) -> int:
     try:
@@ -280,9 +348,9 @@ def main(
     store = RunStore(args.runs_dir.resolve() if args.runs_dir else None)
     try:
         if args.command == "plan":
-            return cmd_plan(args, console, store, llm_factory)
+            return cmd_plan(args, console, store, llm_factory, tools_factory)
         if args.command == "resume":
-            return cmd_resume(args, console, store, llm_factory)
+            return cmd_resume(args, console, store, llm_factory, tools_factory)
         if args.command == "list":
             return cmd_list(console, store)
         if args.command == "show":

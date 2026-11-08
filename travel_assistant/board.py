@@ -25,10 +25,14 @@ class TaskCard:
     result: str = ""
     attempts: int = 0
     error: str = ""
+    sources: tuple[dict[str, str], ...] = ()
+    tool_calls: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["depends_on"] = list(self.depends_on)
+        data["sources"] = list(self.sources)
+        data["tool_calls"] = list(self.tool_calls)
         return data
 
     @classmethod
@@ -44,6 +48,8 @@ class TaskCard:
             result=str(raw.get("result", "")),
             attempts=int(raw.get("attempts", 0) or 0),
             error=str(raw.get("error", "")),
+            sources=tuple(dict(s) for s in raw.get("sources", []) or []),
+            tool_calls=tuple(dict(t) for t in raw.get("tool_calls", []) or []),
         )
 
 

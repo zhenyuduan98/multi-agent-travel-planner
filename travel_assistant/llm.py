@@ -1,17 +1,43 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
-from typing import Any, Awaitable, Callable, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
+
+if TYPE_CHECKING:
+    from travel_assistant.tools import Source, ToolBox
 
 DeltaCallback = Callable[[str], Awaitable[None]]
+ToolEventCallback = Callable[[str, dict[str, Any], "ToolCallRecord"], Awaitable[None]]
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 class LLMConfigError(RuntimeError):
     pass
+
+
+@dataclass
+class ToolCallRecord:
+    name: str
+    arguments: str
+    ok: bool
+    summary: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "arguments": self.arguments, "ok": self.ok, "summary": self.summary}
+
+
+@dataclass
+class AgentResult:
+    """带工具的子 Agent 一次执行的结果：最终文本 + 调用过哪些工具 + 收集到的来源。"""
+
+    text: str
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    sources: list["Source"] = field(default_factory=list)
 
 
 class LLM(Protocol):
@@ -25,6 +51,18 @@ class LLM(Protocol):
         json_mode: bool = False,
         on_delta: DeltaCallback | None = None,
     ) -> str: ...
+
+    async def run_agent(
+        self,
+        system: str,
+        user: str,
+        tools: "ToolBox",
+        *,
+        max_rounds: int = 6,
+        on_delta: DeltaCallback | None = None,
+        on_tool: ToolEventCallback | None = None,
+        require_tool: bool = True,
+    ) -> AgentResult: ...
 
     async def aclose(self) -> None: ...
 
@@ -75,16 +113,92 @@ class QwenLLM:
             response = await self._client.chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
 
+        text, _ = await self._stream(kwargs, on_delta)
+        return text
+
+    async def _stream(
+        self, kwargs: dict[str, Any], on_delta: DeltaCallback | None
+    ) -> tuple[str, list[dict[str, str]]]:
+        """流式请求，返回 (文本, 工具调用列表)。工具调用的参数是分片到达的，按 index 拼接。"""
+
         stream = await self._client.chat.completions.create(stream=True, **kwargs)
         parts: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
         async for chunk in stream:
             if not chunk.choices:
                 continue
-            text = chunk.choices[0].delta.content
-            if text:
-                parts.append(text)
-                await on_delta(text)
-        return "".join(parts)
+            delta = chunk.choices[0].delta
+            if delta.content:
+                parts.append(delta.content)
+                if on_delta is not None:
+                    await on_delta(delta.content)
+            for tc in delta.tool_calls or []:
+                slot = calls.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                slot["id"] += tc.id or ""
+                if tc.function is not None:
+                    slot["name"] += tc.function.name or ""
+                    slot["arguments"] += tc.function.arguments or ""
+        return "".join(parts), [calls[i] for i in sorted(calls)]
+
+    async def run_agent(
+        self,
+        system: str,
+        user: str,
+        tools: "ToolBox",
+        *,
+        max_rounds: int = 6,
+        on_delta: DeltaCallback | None = None,
+        on_tool: ToolEventCallback | None = None,
+        require_tool: bool = True,
+    ) -> AgentResult:
+        """工具调用循环：模型可多轮、并行地调用工具，直到给出最终回答或达到轮数上限。
+
+        require_tool=True 时第一轮强制调用工具，避免模型跳过核实直接凭记忆作答。
+        """
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        result = AgentResult(text="")
+        seen_urls: set[str] = set()
+
+        for round_index in range(max_rounds + 1):
+            kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": self.temperature}
+            if round_index < max_rounds:
+                kwargs["tools"] = tools.specs
+                kwargs["parallel_tool_calls"] = True
+                if round_index == 0 and require_tool:
+                    kwargs["tool_choice"] = "required"
+            text, calls = await self._stream(kwargs, on_delta)
+            if not calls:
+                result.text = text
+                return result
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": text or None,
+                    "tool_calls": [
+                        {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}}
+                        for c in calls
+                    ],
+                }
+            )
+            outcomes = await asyncio.gather(*(tools.call(c["name"], c["arguments"]) for c in calls))
+            for call, outcome in zip(calls, outcomes):
+                record = ToolCallRecord(call["name"], call["arguments"], outcome.ok, outcome.content[:160])
+                result.tool_calls.append(record)
+                for source in outcome.sources:
+                    if source.url not in seen_urls:
+                        seen_urls.add(source.url)
+                        result.sources.append(source)
+                if on_tool is not None:
+                    await on_tool("tool_result", {"name": call["name"], "arguments": call["arguments"]}, record)
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": outcome.content})
+
+        result.text = text
+        return result
 
     async def aclose(self) -> None:
         await self._client.close()
